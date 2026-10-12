@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 .claude/skills/resume-design-debate/scripts/debate_run.py:*)",
+      "Edit(/design/runs/**)"
+    ]
+  }
+}
