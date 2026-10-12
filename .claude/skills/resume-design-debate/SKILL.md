@@ -61,7 +61,11 @@ agent may read), the scope and focus, the template (T2, T3 or T6), and this inst
 *"Do not read any file under design/runs/ other than requirements_snapshot.md. Return only the Markdown artifact."*
 The judge-criteria prompt also includes the focus-adjusted weights as defaults.
 
-When each call returns, save its text to the stage's artifact path and run `H record <run> <stage>`.
+When each call returns, save its text **verbatim** to the stage's artifact path and run `H record <run> <stage>`.
+
+**Never edit agent output**, not even to fix a heading. If `record` reports validation errors, send the
+same agent the error list and its archived output (`parts/failed/…`), ask it for a corrected artifact, then
+`H start` and `H record` again. Files under `parts/failed/` and `parts/superseded/` are evidence; never modify or move them.
 - If the agent errored or returned nothing, run `H fail <run> <stage> --error "<what happened>"`.
 - If validation failed, the helper archives the bad output under `parts/failed/`.
 - Retry a failed stage at most **twice**. On retry, `start` warns when peer artifacts already exist. Keep the

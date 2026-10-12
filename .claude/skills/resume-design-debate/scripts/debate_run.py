@@ -283,7 +283,9 @@ def require_headings(secs: dict[str, str], headings: list[str]) -> list[str]:
 
 
 def percents(body: str) -> list[int]:
-    return [int(x) for x in re.findall(r"\b(\d{1,3})\s*%", body)]
+    """Percentages in a weights section, ignoring any 'Total' row."""
+    return [int(x) for line in body.splitlines() if "total" not in line.lower()
+            for x in re.findall(r"\b(\d{1,3})\s*%", line)]
 
 
 def validate(kind: str, text: str, stage: str) -> tuple[list[str], list[str]]:
@@ -453,10 +455,13 @@ def cmd_start(run_dir: Path, a) -> dict:
         raise StateError(f"stage {a.stage} blocked; prerequisites not ok: {missing}")
     if st["status"] == "in_progress":
         event(m, "interrupted_attempt_detected", stage=a.stage)
-    # A fresh attempt never inherits output from an earlier one.
-    stale = archive_failed(run_dir, table[a.stage][0], a.stage, st.get("attempts", 0), suffix="stale")
-    if stale:
-        event(m, "archived_stale_output", stage=a.stage, path=stale)
+    # A retry never inherits output from an earlier attempt. (On a first attempt the
+    # orchestrator may already have saved the output, e.g. the judge's two-file reply.)
+    if st.get("attempts", 0) > 0:
+        stale = archive_failed(run_dir, table[a.stage][0], a.stage, st["attempts"], suffix="stale")
+        if stale:
+            event(m, "archived_stale_output", stage=a.stage, path=stale,
+                  sha256=sha256_file(run_dir / stale))
     peers_present = [p for p in PEER_ARTIFACTS.get(a.stage, []) if (run_dir / p).exists()]
     st.update(status="in_progress", started_at=now(), agent=a.agent or table[a.stage][1])
     st["attempts"] = st.get("attempts", 0) + 1
@@ -507,7 +512,8 @@ def cmd_record(run_dir: Path, a) -> dict:
     if errors:
         archived = archive_failed(run_dir, rel, a.stage, attempt)
         st.update(status="failed", failed_at=now(), errors=errors, archived=archived)
-        event(m, "validation_failed", stage=a.stage, errors=errors)
+        event(m, "validation_failed", stage=a.stage, errors=errors, archived=archived,
+              sha256=sha256_file(run_dir / archived) if archived else None)
         save(run_dir, m)
         return {"ok": False, "stage": a.stage, "errors": errors, "archived": archived}
     st.update(status="ok", completed_at=now(), sha256=sha256_file(path), warnings=warnings,
@@ -546,7 +552,8 @@ def cmd_fail(run_dir: Path, a) -> dict:
         raise StateError(f"stage {a.stage} already ok")
     archived = archive_failed(run_dir, table[a.stage][0], a.stage, st.get("attempts", 0) or 1)
     st.update(status="failed", failed_at=now(), errors=[a.error], archived=archived)
-    event(m, "agent_failed", stage=a.stage, error=a.error)
+    event(m, "agent_failed", stage=a.stage, error=a.error, archived=archived,
+          sha256=sha256_file(run_dir / archived) if archived else None)
     save(run_dir, m)
     return {"ok": True, "stage": a.stage, "status": "failed", "archived": archived}
 

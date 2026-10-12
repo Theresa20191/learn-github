@@ -169,6 +169,11 @@ class Validation(Base):
         out = self.write_and_record("judge_criteria", "parts/judge_criteria.md", bad, expect_ok=False)
         self.assertTrue(any("sum to 105%" in e for e in out["errors"]))
 
+    def test_weights_total_row_ignored(self):
+        self.write_and_record("requirements", "requirements_snapshot.md", fixture("requirements.md"))
+        txt = fixture("criteria.md").replace("## Weight changes", "| **Total** | **100%** |\n## Weight changes")
+        self.write_and_record("judge_criteria", "parts/judge_criteria.md", txt)
+
     def test_focus_weights(self):
         for focus in ("balanced", "reliability", "quality", "cost", "automation"):
             code, out = run(self.root, "weights", "--focus", focus)
@@ -231,6 +236,23 @@ class Recovery(Base):
         self.assertTrue(out["ok"], out)
         m = json.loads((self.dir / "manifest.json").read_text())
         self.assertEqual(m["stages"]["proposal_a"]["independence"], "clean")
+
+    def test_first_attempt_keeps_presaved_output(self):
+        # The judge returns matrix + decision together; decision is saved before its stage starts.
+        self.independent_stages()
+        self.debate_stages()
+        (self.dir / "final_decision.md").write_text(fixture("decision.md"))
+        self.write_and_record("comparison_matrix", "comparison_matrix.md", fixture("matrix.md"))
+        run(self.root, "start", self.run_id, "final_decision")
+        self.assertTrue((self.dir / "final_decision.md").is_file())
+        self.assertTrue(run(self.root, "record", self.run_id, "final_decision")[1]["ok"])
+
+    def test_failed_archive_is_hashed(self):
+        self.write_and_record("requirements", "requirements_snapshot.md", fixture("requirements.md"))
+        self.write_and_record("proposal_a", "proposal_a.md", "# junk", expect_ok=False)
+        m = json.loads((self.dir / "manifest.json").read_text())
+        ev = [e for e in m["events"] if e["event"] == "validation_failed"][-1]
+        self.assertRegex(ev["sha256"], r"^[0-9a-f]{64}$")
 
     def test_restart_archives_stale_output(self):
         self.write_and_record("requirements", "requirements_snapshot.md", fixture("requirements.md"))
