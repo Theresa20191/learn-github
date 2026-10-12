@@ -41,14 +41,26 @@ installs, no destructive git commands, no commits unless the user asks.
 2. **Hard stop.** If no source actually describes Resume Auto-Pilot (its inputs, outputs and
    constraints), do not invent requirements. Run `H block <run> --reason "no Resume Auto-Pilot requirements found in <places searched>"`,
    report what you searched, and ask the user for a requirements file or the correct repository. Then stop.
-3. Write `<run_dir>/requirements_snapshot.md` using template T1. Every item must carry
-   `[source: path:line]`. Anything you had to infer is `[unsourced: needs user confirmation]`.
-   Record missing requirements and conflicts under *Gaps and conflicts*. For a named-module scope, keep the module's
-   requirements plus **all** cross-cutting safety, privacy and factual-integrity constraints.
-4. `H start <run> requirements`, then `H record <run> requirements`. If validation fails, fix the snapshot and record again.
-5. If any optimisation priority is unsourced, or *Gaps and conflicts* contains a conflict that changes
-   priorities, ask the user (one AskUserQuestion, at most 4 questions) before Stage 2. Record the answers in
-   the snapshot as `[source: user, <date>]`. Note that this changes the hash, so record it again.
+3. **Draft.** Write `<run_dir>/requirements_snapshot.md` using template T1. It stays a draft until step 5, so
+   do not run `start` or `record` yet. Every item must carry `[source: path:line]`. Tag anything you had to infer
+   `[unsourced: needs user confirmation]`. Record missing requirements and conflicts under *Gaps and conflicts*.
+   For a named-module scope, keep the module's requirements plus **all** cross-cutting safety, privacy and
+   factual-integrity constraints.
+4. **Ask before freezing.** If the draft has any `[unsourced` item, or *Gaps and conflicts* has a conflict that
+   changes priorities, ask the user **now** in one AskUserQuestion with at most 4 questions. Ask nothing else.
+   - Retag each answered item `[source: user, <date>]` and log it under *User confirmations* as `- Q: … A: …`.
+   - Retag each item the user declines, or that you cannot ask about in a non-interactive session, as
+     `[unconfirmed: <reason>]`. Never make up an answer.
+   - If nothing needed asking, write `- None required: every item is sourced.`
+5. **Freeze.** Run `H start <run> requirements`, then `H record <run> requirements`. Recording rejects any remaining
+   `[unsourced` tag and any `[source: user …]` without a logged Q/A.
+   - If validation fails, the draft is archived to `parts/failed/`. Write a corrected draft and run `start`/`record` again.
+     This is allowed only because nothing was frozen yet.
+6. **Frozen means frozen.** After a successful `record`, never edit `requirements_snapshot.md`. If the user later
+   changes a requirement or an answer, at any stage including after `completed`, run
+   `H supersede <run> --reason "<what changed>"`. This marks the old run `superseded`, leaves its artifacts byte-for-byte
+   untouched, and returns a new linked run id. Restart Stage 1 in the new run. The helper refuses to start or record
+   `requirements` again in a run whose snapshot hash is recorded.
 
 ## Stages 2 and 3: Independent proposals and blind risk assessments (parallel)
 
@@ -138,7 +150,10 @@ Run `H status <run>` and then `H next <run>`.
 - `invalidated` lists stages whose artifact or prerequisite changed after recording. These, and everything after them, must be rerun.
   New output goes to a fresh file; the old one is never silently reused.
 - Continue with the `runnable` stages. Never overwrite a stage that is `ok`; the helper refuses to.
-If a run is `blocked`, start a new run once the blocker is resolved. Never edit the blocked run.
+- If `next` returns `action: supersede` (the run status is `requirements_changed`), the frozen snapshot was edited.
+  Do not repair it. Run `H supersede <run> --reason …` and continue in the new run.
+If a run is `blocked` or `superseded`, it is immutable: the helper refuses to start or record any stage in it.
+Start a new run once the blocker is resolved.
 
 ## Debate quality rules (apply them in every prompt)
 - Both architects get the same frozen snapshot, and the hash is in the manifest.

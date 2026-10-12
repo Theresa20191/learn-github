@@ -139,12 +139,6 @@ class Validation(Base):
         out = self.write_and_record("requirements", "requirements_snapshot.md", bad, expect_ok=False)
         self.assertTrue(any("FR-1" in e for e in out["errors"]))
 
-    def test_unsourced_tag_is_warning(self):
-        txt = fixture("requirements.md").replace("[source: docs/requirements.md:9]",
-                                                 "[unsourced: needs user confirmation]")
-        out = self.write_and_record("requirements", "requirements_snapshot.md", txt)
-        self.assertTrue(out["warnings"])
-
     def test_proposal_missing_section(self):
         self.write_and_record("requirements", "requirements_snapshot.md", fixture("requirements.md"))
         bad = fixture("proposal.md").replace("## 8. Test strategy", "## 8. Tests")
@@ -301,6 +295,165 @@ class Recovery(Base):
         self.assertEqual(out["status"], "blocked")
         code, fin = run(self.root, "finalize", self.run_id)
         self.assertEqual(fin["status"], "blocked")
+
+
+class Stage1Freeze(Base):
+    """Regression tests for the Stage 1 snapshot defect found in a live run.
+
+    The original failure: the orchestrator recorded the snapshot, asked the user
+    afterwards and then edited the frozen snapshot (the helper refused to re-record),
+    after which `next` offered `requirements` as runnable again in the same run.
+    """
+    def draft_with_question(self):
+        return fixture("requirements.md").replace("[source: docs/requirements.md:9]",
+                                                  "[unsourced: needs user confirmation]")
+
+    def answered(self):
+        return (fixture("requirements.md")
+                .replace("[source: docs/requirements.md:9]", "[source: user, 2026-10-12]")
+                .replace("- None required: every item is sourced.",
+                         "- Q: Is factual integrity ranked above speed? A: Yes (2026-10-12) -> PR-1"))
+
+    def snapshot(self):
+        return (self.dir / "requirements_snapshot.md").read_bytes()
+
+    # --- original failure -------------------------------------------------
+    def test_original_failure_edit_after_freeze_cannot_be_rerecorded(self):
+        self.write_and_record("requirements", "requirements_snapshot.md", fixture("requirements.md"))
+        frozen = json.loads((self.dir / "manifest.json").read_text())["requirements_sha256"]
+        # the old step 5: append the user's answer to the already-frozen snapshot
+        with open(self.dir / "requirements_snapshot.md", "a") as f:
+            f.write("- Q: late question A: late answer\n")
+        code, nxt = run(self.root, "next", self.run_id)
+        self.assertEqual(nxt["runnable"], [])  # previously: requirements was runnable again
+        self.assertEqual(nxt["run_status"], "requirements_changed")
+        self.assertEqual(nxt["action"], "supersede")
+        for cmd in ("start", "record"):
+            code, out = run(self.root, cmd, self.run_id, "requirements")
+            self.assertEqual(code, 2, out)
+        code, out = run(self.root, "start", self.run_id, "proposal_a")
+        self.assertEqual(code, 2, out)
+        m = json.loads((self.dir / "manifest.json").read_text())
+        self.assertEqual(m["requirements_sha256"], frozen)  # recorded hash never rewritten
+        ev = [e for e in m["events"] if e["event"] == "requirements_changed_after_freeze"]
+        self.assertEqual(ev[0]["recorded_sha256"], frozen)
+        self.assertNotEqual(ev[0]["current_sha256"], frozen)
+
+    def test_frozen_requirements_refuse_restart_even_without_edit(self):
+        self.write_and_record("requirements", "requirements_snapshot.md", fixture("requirements.md"))
+        code, out = run(self.root, "start", self.run_id, "requirements")
+        self.assertEqual(code, 2)
+
+    def test_edit_after_debate_started_invalidates_everything_downstream(self):
+        self.independent_stages()
+        self.debate_stages()
+        with open(self.dir / "requirements_snapshot.md", "a") as f:
+            f.write("\nchanged\n")
+        code, nxt = run(self.root, "next", self.run_id)
+        self.assertIn("rebuttal_2", nxt["invalidated"])
+        self.assertEqual(nxt["action"], "supersede")
+        code, fin = run(self.root, "finalize", self.run_id)
+        self.assertEqual(fin["status"], "requirements_changed")
+        self.assertFalse(fin["ok"])
+
+    # --- corrected workflow ------------------------------------------------
+    def test_unanswered_question_blocks_freezing(self):
+        out = self.write_and_record("requirements", "requirements_snapshot.md", self.draft_with_question(),
+                                    expect_ok=False)
+        self.assertTrue(any("PR-1 is still [unsourced]" in e for e in out["errors"]))
+        m = json.loads((self.dir / "manifest.json").read_text())
+        self.assertIsNone(m["requirements_sha256"])  # nothing was frozen
+
+    def test_answers_collected_before_freeze_then_record(self):
+        # draft rejected -> user asked -> answered draft recorded, in the same (unfrozen) run
+        self.write_and_record("requirements", "requirements_snapshot.md", self.draft_with_question(),
+                              expect_ok=False)
+        out = self.write_and_record("requirements", "requirements_snapshot.md", self.answered())
+        self.assertEqual(out["warnings"], [])
+        self.assertIn(b"Q: Is factual integrity ranked above speed?", self.snapshot())
+        m = json.loads((self.dir / "manifest.json").read_text())
+        self.assertEqual(m["stages"]["requirements"]["attempts"], 2)
+        self.assertTrue((self.dir / "parts/failed/requirements.attempt1.md").is_file())
+
+    def test_ids_mentioned_outside_requirement_sections_are_references(self):
+        # live Stage 1 run: "- NFR-1 is the only cost figure" under Gaps was flagged as a duplicate
+        txt = fixture("requirements.md").replace("- None found in fixture.",
+                                                 "- NFR-1 is the only performance figure; see FR-1.")
+        self.write_and_record("requirements", "requirements_snapshot.md", txt)
+
+    def test_corrected_draft_written_before_restart_is_kept(self):
+        # live Stage 1 run: failed record -> corrected draft written -> start archived it as stale
+        self.write_and_record("requirements", "requirements_snapshot.md", self.draft_with_question(),
+                              expect_ok=False)
+        (self.dir / "requirements_snapshot.md").write_text(self.answered())
+        code, out = run(self.root, "start", self.run_id, "requirements")
+        self.assertEqual(code, 0, out)
+        self.assertTrue((self.dir / "requirements_snapshot.md").is_file())
+        code, rec = run(self.root, "record", self.run_id, "requirements")
+        self.assertTrue(rec["ok"], rec)
+        self.assertFalse(list((self.dir / "parts/failed").glob("*stale*")))
+
+    def test_user_source_requires_logged_question(self):
+        txt = fixture("requirements.md").replace("[source: docs/requirements.md:9]", "[source: user, 2026-10-12]")
+        out = self.write_and_record("requirements", "requirements_snapshot.md", txt, expect_ok=False)
+        self.assertTrue(any("User confirmations" in e for e in out["errors"]))
+
+    def test_unconfirmed_assumption_is_warning_and_reported(self):
+        txt = fixture("requirements.md").replace("[source: docs/requirements.md:9]",
+                                                 "[unconfirmed: non-interactive run, could not ask]")
+        out = self.write_and_record("requirements", "requirements_snapshot.md", txt)
+        self.assertEqual(out["warnings"], ["PR-1 is an unconfirmed assumption"])
+        code, fin = run(self.root, "finalize", self.run_id)
+        self.assertEqual(fin["checks"]["unconfirmed_requirements"], ["PR-1 is an unconfirmed assumption"])
+
+    def test_missing_user_confirmations_section_rejected(self):
+        txt = fixture("requirements.md").replace("## User confirmations\n- None required: every item is sourced.\n", "")
+        out = self.write_and_record("requirements", "requirements_snapshot.md", txt, expect_ok=False)
+        self.assertIn("missing section '## User confirmations'", out["errors"])
+
+    def test_supersede_creates_linked_run_and_keeps_old_immutable(self):
+        self.independent_stages()
+        before = {p.relative_to(self.dir): p.read_bytes() for p in self.dir.rglob("*.md")}
+        code, out = run(self.root, "supersede", self.run_id, "--reason", "user changed PR-1")
+        self.assertEqual(code, 0, out)
+        new_id = out["new_run_id"]
+        self.assertNotEqual(new_id, self.run_id)
+        after = {p.relative_to(self.dir): p.read_bytes() for p in self.dir.rglob("*.md")}
+        self.assertEqual(before, after)  # old artifacts byte-identical
+        old = json.loads((self.dir / "manifest.json").read_text())
+        new_dir = self.dir.parent / new_id
+        new = json.loads((new_dir / "manifest.json").read_text())
+        self.assertEqual((old["status"], old["superseded_by"]), ("superseded", new_id))
+        self.assertEqual((new["supersedes"], new["status"]), (self.run_id, "in_progress"))
+        self.assertEqual(new["args"], old["args"])
+        self.assertIsNone(new["requirements_sha256"])
+        self.assertFalse((new_dir / "requirements_snapshot.md").exists())
+        # the old run is now inert
+        for cmd in (["start", self.run_id, "cross_exam_1_a"], ["record", self.run_id, "cross_exam_1_a"],
+                    ["fail", self.run_id, "cross_exam_1_a", "--error", "x"],
+                    ["block", self.run_id, "--reason", "x"], ["supersede", self.run_id, "--reason", "again"]):
+            self.assertEqual(run(self.root, *cmd)[0], 2, cmd)
+        self.assertEqual(run(self.root, "next", self.run_id)[1]["runnable"], [])
+        # the new run freezes its own (answered) snapshot normally
+        code, _ = run(self.root, "start", new_id, "requirements")
+        (new_dir / "requirements_snapshot.md").write_text(self.answered())
+        code, rec = run(self.root, "record", new_id, "requirements")
+        self.assertTrue(rec["ok"], rec)
+        self.assertNotEqual(json.loads((new_dir / "manifest.json").read_text())["requirements_sha256"],
+                            old["requirements_sha256"])
+
+    def test_supersede_after_tamper_and_guard_still_clean(self):
+        self.write_and_record("requirements", "requirements_snapshot.md", fixture("requirements.md"))
+        (self.dir / "requirements_snapshot.md").write_text("tampered")
+        run(self.root, "next", self.run_id)
+        code, out = run(self.root, "supersede", self.run_id, "--reason", "snapshot edited after freeze")
+        self.assertEqual(code, 0)
+        old = json.loads((self.dir / "manifest.json").read_text())
+        self.assertEqual(old["status"], "superseded")
+        self.assertEqual([e["previous_status"] for e in old["events"] if e["event"] == "superseded"],
+                         ["requirements_changed"])
+        self.assertTrue(run(self.root, "guard", self.run_id)[1]["ok"])
+        self.assertTrue(run(self.root, "guard", out["new_run_id"])[1]["ok"])
 
 
 class Guard(Base):

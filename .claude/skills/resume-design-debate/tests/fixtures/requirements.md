@@ -16,5 +16,7 @@ Scope: full-system. Focus: balanced.
 - PR-1 Factual integrity over speed [source: docs/requirements.md:9]
 ## Gaps and conflicts
 - None found in fixture.
+## User confirmations
+- None required: every item is sourced.
 ## Sources
 - docs/requirements.md  (synthetic)

@@ -24,15 +24,23 @@ Scope: <full-system | module name>. Focus: <focus>. Frozen at commit <sha>.
 ## Acceptance tests
 - AT-1 <observable pass/fail check> (covers FR-1, SP-2) [source: ...]
 ## Optimisation priorities
-- PR-1 <priority, ordered> [source: ...]   or   [unsourced: needs user confirmation]
+- PR-1 <priority, ordered> [source: ...]
 ## Gaps and conflicts
 - <missing requirement or conflict between sources, and how it was handled>
+## User confirmations
+- Q: <question asked before freezing> A: <user's answer> (<date>) → affects PR-1
+  (or "None required: every item is sourced.")
 ## Sources
 - path/to/file.md  (what it contributed)
 ```
 
-Every requirement line carries `[source: ...]`, or `[unsourced: needs user confirmation]`
-when it was not stated anywhere. Never add a priority silently.
+Tags and their lifecycle:
+- `[unsourced: needs user confirmation]` is allowed **only in the draft**. `record` rejects it.
+- Before recording, ask the user. Retag each answered item `[source: user, <date>]` and log it under
+  *User confirmations*. Retag an item the user declined, or that can't be asked about (non-interactive run),
+  as `[unconfirmed: <reason>]`. That is accepted, but reported as a warning.
+- Once recorded, the snapshot is frozen. Changed requirements or answers mean `supersede`, which creates a new run.
+  Never edit a recorded snapshot. Never add a priority silently.
 
 ---
 

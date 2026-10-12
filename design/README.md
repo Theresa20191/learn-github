@@ -22,7 +22,9 @@ In Claude Code, from the repository root:
 | `requirements` | path to the requirements or spec source | auto-discovered |
 | `resume` | id of an earlier run to continue | (new run) |
 
-The debate **stops at Stage 1** unless the repository (or `requirements=`) contains a
+Stage 1 asks any open requirement questions *before* freezing the snapshot. After that,
+the snapshot is immutable. If you later change a requirement or an answer, the run is
+superseded by a new linked run; it is never edited. The debate **stops at Stage 1** unless the repository (or `requirements=`) contains a
 real description of Resume Auto-Pilot. It does not invent requirements.
 
 In both modes the debate only writes under `design/`. Implementation starts only after
@@ -55,6 +57,7 @@ $H status <run_id>            # per-stage status
 $H next <run_id>              # resume point, interrupted or invalidated stages
 $H check-independence <run_id>
 $H guard <run_id>             # design-only check: nothing changed outside design/
+$H supersede <run_id> --reason "..."   # requirements/answers changed after freezing: new linked run
 ```
 
 ## Tests

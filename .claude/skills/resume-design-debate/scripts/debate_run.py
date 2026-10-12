@@ -18,6 +18,7 @@ Usage (run from the repository root, or pass --root):
   debate_run.py add-round RUN --reason MSG
   debate_run.py guard  RUN
   debate_run.py block  RUN --reason MSG
+  debate_run.py supersede RUN --reason MSG   (requirements/answers changed after freezing)
   debate_run.py finalize RUN
   debate_run.py status RUN
   debate_run.py list
@@ -87,8 +88,11 @@ REQUIREMENTS_HEADINGS = [
     "Acceptance tests",
     "Optimisation priorities",
     "Gaps and conflicts",
+    "User confirmations",
     "Sources",
 ]
+# Run states in which stages may still be started or recorded.
+ACTIVE_STATUSES = ("in_progress", "incomplete")
 RISK_HEADINGS = ["Failure modes", "Independence attestation"]
 CROSS_HEADINGS = ["Strongest aspects", "Weaknesses", "Disagreements to resolve"]
 REBUTTAL_HEADINGS = ["Concessions", "Rejected objections", "Revisions", "Revised proposal"]
@@ -159,6 +163,8 @@ JUDGE_INPUTS = [
     "cross_exam_round_1.md", "rebuttal_round_2.md",
 ]
 
+# Only these sections define requirements; IDs mentioned elsewhere (gaps, Q/A) are references.
+REQUIREMENT_SECTIONS = REQUIREMENTS_HEADINGS[:6]
 REQ_ID = re.compile(r"^\s*[-*]\s*\**((?:FR|NFR|SP|OP|AT|PR)-\d+)\b")
 
 
@@ -299,15 +305,22 @@ def validate(kind: str, text: str, stage: str) -> tuple[list[str], list[str]]:
     if kind == "requirements":
         errors += require_headings(secs, REQUIREMENTS_HEADINGS)
         ids = []
-        for line in text.splitlines():
+        req_lines = [ln for h in REQUIREMENT_SECTIONS for ln in secs.get(h.lower(), "").splitlines()]
+        for line in req_lines:
             m = REQ_ID.match(line)
             if not m:
                 continue
             ids.append(m.group(1))
-            if "[source:" not in line and "[unsourced" not in line.lower():
-                errors.append(f"{m.group(1)} has no [source: ...] or [unsourced ...] tag")
-            elif "[unsourced" in line.lower():
-                warnings.append(f"{m.group(1)} is unsourced and needs user confirmation")
+            low = line.lower()
+            if "[unsourced" in low:
+                # Questions are asked BEFORE the snapshot is frozen; a frozen snapshot
+                # can never be amended with the answers (supersede instead).
+                errors.append(f"{m.group(1)} is still [unsourced]; ask the user and tag it "
+                              "[source: user, <date>] or [unconfirmed: <reason>] before recording")
+            elif "[unconfirmed" in low:
+                warnings.append(f"{m.group(1)} is an unconfirmed assumption")
+            elif "[source:" not in low:
+                errors.append(f"{m.group(1)} has no [source: ...] or [unconfirmed: ...] tag")
         if not ids:
             errors.append("no requirement IDs (FR-/NFR-/SP-/OP-/AT-/PR-) found")
         if not any(i.startswith("AT-") for i in ids):
@@ -317,6 +330,8 @@ def validate(kind: str, text: str, stage: str) -> tuple[list[str], list[str]]:
         src = secs.get("sources", "")
         if not re.search(r"\S", src):
             errors.append("'## Sources' is empty")
+        if "[source: user" in text.lower() and not re.search(r"(?im)^\s*[-*]\s*Q:", secs.get("user confirmations", "")):
+            errors.append("items cite [source: user, ...] but '## User confirmations' records no '- Q: ... A: ...' entries")
 
     elif kind == "proposal":
         errors += require_headings(secs, PROPOSAL_HEADINGS)
@@ -437,6 +452,15 @@ def cmd_init(root: Path, a) -> dict:
     return {"ok": True, "run_id": run_id, "run_dir": str(run_dir)}
 
 
+def require_active(m: dict, stage: str | None = None) -> None:
+    if m["status"] not in ACTIVE_STATUSES:
+        extra = f" (superseded by {m['superseded_by']})" if m.get("superseded_by") else ""
+        raise StateError(f"run is {m['status']}{extra}; it is immutable. Start or use a new run")
+    if stage == "requirements" and m.get("requirements_sha256"):
+        raise StateError("requirements are frozen for this run (sha256 recorded). A changed requirement or "
+                          "answer needs a new run: debate_run.py supersede RUN --reason ...")
+
+
 def check_deps(manifest: dict, stage: str) -> list[str]:
     table = stage_table(manifest)
     return [d for d in table[stage][2] if manifest["stages"][d]["status"] != "ok"]
@@ -450,14 +474,16 @@ def cmd_start(run_dir: Path, a) -> dict:
     st = m["stages"][a.stage]
     if st["status"] == "ok":
         raise StateError(f"stage {a.stage} already ok; earlier debate artifacts are never overwritten")
+    require_active(m, a.stage)
     missing = check_deps(m, a.stage)
     if missing:
         raise StateError(f"stage {a.stage} blocked; prerequisites not ok: {missing}")
     if st["status"] == "in_progress":
         event(m, "interrupted_attempt_detected", stage=a.stage)
-    # A retry never inherits output from an earlier attempt. (On a first attempt the
-    # orchestrator may already have saved the output, e.g. the judge's two-file reply.)
-    if st.get("attempts", 0) > 0:
+    # A retry never inherits output from an interrupted or invalidated attempt. After a
+    # *failed* attempt the bad output was already archived by record/fail, so a file present
+    # now is the new attempt's output (e.g. a corrected draft or the judge's two-file reply).
+    if st["status"] in ("in_progress", "invalidated"):
         stale = archive_failed(run_dir, table[a.stage][0], a.stage, st["attempts"], suffix="stale")
         if stale:
             event(m, "archived_stale_output", stage=a.stage, path=stale,
@@ -500,6 +526,7 @@ def cmd_record(run_dir: Path, a) -> dict:
     st = m["stages"][a.stage]
     if st["status"] == "ok":
         raise StateError(f"stage {a.stage} already ok")
+    require_active(m, a.stage)
     missing = check_deps(m, a.stage)
     if missing:
         raise StateError(f"stage {a.stage} blocked; prerequisites not ok: {missing}")
@@ -550,6 +577,7 @@ def cmd_fail(run_dir: Path, a) -> dict:
     st = m["stages"][a.stage]
     if st["status"] == "ok":
         raise StateError(f"stage {a.stage} already ok")
+    require_active(m)
     archived = archive_failed(run_dir, table[a.stage][0], a.stage, st.get("attempts", 0) or 1)
     st.update(status="failed", failed_at=now(), errors=[a.error], archived=archived)
     event(m, "agent_failed", stage=a.stage, error=a.error, archived=archived,
@@ -579,6 +607,11 @@ def verify_integrity(run_dir: Path, m: dict) -> list[str]:
     for stage in invalid:
         m["stages"][stage].update(status="invalidated", errors=["artifact or prerequisite changed after recording"])
         event(m, "invalidated", stage=stage)
+    if "requirements" in invalid and m["status"] in ACTIVE_STATUSES:
+        p = run_dir / table["requirements"][0]
+        m["status"] = "requirements_changed"
+        event(m, "requirements_changed_after_freeze", recorded_sha256=m["requirements_sha256"],
+              current_sha256=sha256_file(p) if p.is_file() else None)
     return invalid
 
 
@@ -601,7 +634,12 @@ def cmd_next(run_dir: Path, _a) -> dict:
             runnable.append({"stage": stage, "agent": table[stage][1], "artifact": table[stage][0],
                              "previous_status": st["status"], "attempts": st.get("attempts", 0)})
     done = all(m["stages"][s]["status"] == "ok" for s in table)
-    return {"ok": True, "run_id": m["run_id"], "run_status": m["status"], "all_stages_ok": done,
+    action = None
+    if m["status"] not in ACTIVE_STATUSES:
+        runnable = []  # an inactive run never advances
+        action = ("supersede" if m["status"] == "requirements_changed"
+                  else f"run is {m['status']}; nothing to resume")
+    return {"ok": True, "action": action, "run_id": m["run_id"], "run_status": m["status"], "all_stages_ok": done,
             "runnable": runnable, "interrupted": interrupted, "recoverable": recoverable,
             "invalidated": invalid}
 
@@ -612,6 +650,7 @@ def cmd_assemble(run_dir: Path, a) -> dict:
         raise StateError(f"{a.stage} is not an assembled stage")
     if m["stages"].get(a.stage, {}).get("status") == "ok":
         raise StateError(f"{a.stage} already ok; not overwriting")
+    require_active(m)
     title, parts = ASSEMBLED_FROM[a.stage]
     missing = check_deps(m, a.stage)
     if missing:
@@ -669,6 +708,7 @@ def cmd_check_independence(run_dir: Path, _a) -> dict:
 
 def cmd_add_round(run_dir: Path, a) -> dict:
     m = load(run_dir)
+    require_active(m)
     if m.get("round3"):
         raise StateError("an additional round was already added; only one is permitted")
     if m["stages"]["rebuttal_2"]["status"] != "ok":
@@ -715,11 +755,40 @@ def cmd_guard(run_dir: Path, _a) -> dict:
 
 def cmd_block(run_dir: Path, a) -> dict:
     m = load(run_dir)
+    require_active(m)
     m["status"] = "blocked"
     m["blocked_reason"] = a.reason
     event(m, "blocked", reason=a.reason)
     save(run_dir, m)
     return {"ok": True, "status": "blocked", "reason": a.reason}
+
+
+def cmd_supersede(run_dir: Path, a) -> dict:
+    """Close a run whose requirements or answers changed and open a fresh linked run.
+
+    The old run's artifacts are left byte-for-byte untouched; only its manifest
+    gains the new status, link and event.
+    """
+    m = load(run_dir)
+    if m.get("superseded_by"):
+        raise StateError(f"run already superseded by {m['superseded_by']}")
+    root = run_dir.parents[2]
+    new = cmd_init(root, argparse.Namespace(scope=m["args"]["scope"], focus=m["args"]["focus"],
+                                            mode=m["args"]["mode"]))
+    new_dir = Path(new["run_dir"])
+    nm = load(new_dir)
+    nm["supersedes"] = m["run_id"]
+    nm["supersede_reason"] = a.reason
+    event(nm, "supersedes", run=m["run_id"], reason=a.reason)
+    save(new_dir, nm)
+    prev = m["status"]
+    m["status"] = "superseded"
+    m["superseded_by"] = nm["run_id"]
+    m["superseded_reason"] = a.reason
+    event(m, "superseded", by=nm["run_id"], reason=a.reason, previous_status=prev)
+    save(run_dir, m)
+    return {"ok": True, "old_run": m["run_id"], "old_status": "superseded", "new_run_id": nm["run_id"],
+            "new_run_dir": str(new_dir)}
 
 
 def cmd_finalize(run_dir: Path, a) -> dict:
@@ -738,10 +807,16 @@ def cmd_finalize(run_dir: Path, a) -> dict:
         dec = sections((run_dir / "final_decision.md").read_text()).get("additional round", "")
         if re.search(r"(?i)required:\s*yes", dec) and not m.get("round3"):
             problems.append("judge requested an additional round; run add-round")
-    m["status"] = "completed" if not problems else ("blocked" if m["status"] == "blocked" else "incomplete")
+    if m["status"] not in ACTIVE_STATUSES + ("completed",):
+        problems.append(f"run is {m['status']}")
+        new_status = m["status"]  # blocked / superseded / requirements_changed stay as they are
+    else:
+        new_status = "completed" if not problems else "incomplete"
+    m["status"] = new_status
     m["finalized_at"] = now()
     m["acceptance_checks"] = {"all_stages_ok": nxt["all_stages_ok"], "guard_ok": guard["ok"],
                               "independence_ok": ind["ok"], "independence_weakened": ind["weakened"],
+                              "unconfirmed_requirements": m["stages"]["requirements"].get("warnings", []),
                               "problems": problems}
     event(m, "finalize", status=m["status"])
     save(run_dir, m)
@@ -808,7 +883,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("next", "judge-inputs", "check-independence", "guard", "finalize", "status"):
         s = sub.add_parser(name)
         s.add_argument("run")
-    for name in ("add-round", "block"):
+    for name in ("add-round", "block", "supersede"):
         s = sub.add_parser(name)
         s.add_argument("run")
         s.add_argument("--reason", required=True)
@@ -821,7 +896,7 @@ def main(argv: list[str] | None = None) -> int:
         "start": cmd_start, "record": cmd_record, "fail": cmd_fail, "next": cmd_next,
         "assemble": cmd_assemble, "judge-inputs": cmd_judge_inputs,
         "check-independence": cmd_check_independence, "add-round": cmd_add_round,
-        "guard": cmd_guard, "block": cmd_block, "finalize": cmd_finalize, "status": cmd_status,
+        "guard": cmd_guard, "block": cmd_block, "supersede": cmd_supersede, "finalize": cmd_finalize, "status": cmd_status,
     }
     try:
         if a.cmd in run_cmds:
