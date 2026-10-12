@@ -126,7 +126,11 @@ note to `design/runs/<run_id>/implementation_log.md`. Never edit the debate arti
 ## Resume
 
 Run `H status <run>` and then `H next <run>`.
-- `interrupted` lists stages that were started but never recorded. Treat them as failed and rerun them.
+- `recoverable` lists interrupted stages whose artifact was saved but never recorded. Run `H record` on each
+  first. This resumes from the last valid artifact, and the stage keeps the independence status of its original
+  launch. Rerun the stage only if `record` fails validation.
+- Any other stage in `interrupted` was started but its output never arrived. Rerun it. `start` archives any stale
+  file under `parts/failed/`, so a new attempt never inherits old output.
 - `invalidated` lists stages whose artifact or prerequisite changed after recording. These, and everything after them, must be rerun.
   New output goes to a fresh file; the old one is never silently reused.
 - Continue with the `runnable` stages. Never overwrite a stage that is `ok`; the helper refuses to.

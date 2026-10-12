@@ -451,9 +451,13 @@ def cmd_start(run_dir: Path, a) -> dict:
     missing = check_deps(m, a.stage)
     if missing:
         raise StateError(f"stage {a.stage} blocked; prerequisites not ok: {missing}")
-    peers_present = [p for p in PEER_ARTIFACTS.get(a.stage, []) if (run_dir / p).exists()]
     if st["status"] == "in_progress":
         event(m, "interrupted_attempt_detected", stage=a.stage)
+    # A fresh attempt never inherits output from an earlier one.
+    stale = archive_failed(run_dir, table[a.stage][0], a.stage, st.get("attempts", 0), suffix="stale")
+    if stale:
+        event(m, "archived_stale_output", stage=a.stage, path=stale)
+    peers_present = [p for p in PEER_ARTIFACTS.get(a.stage, []) if (run_dir / p).exists()]
     st.update(status="in_progress", started_at=now(), agent=a.agent or table[a.stage][1])
     st["attempts"] = st.get("attempts", 0) + 1
     if a.stage in PEER_ARTIFACTS:
@@ -467,13 +471,17 @@ def cmd_start(run_dir: Path, a) -> dict:
     return out
 
 
-def archive_failed(run_dir: Path, rel: str, stage: str, attempt: int) -> str | None:
+def archive_failed(run_dir: Path, rel: str, stage: str, attempt: int, suffix: str = "") -> str | None:
     src = run_dir / rel
     if not src.exists():
         return None
     dest_dir = run_dir / "parts" / "failed"
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"{stage}.attempt{attempt}.md"
+    dest = dest_dir / f"{stage}.attempt{attempt}{'.' + suffix if suffix else ''}.md"
+    n = 1
+    while dest.exists():  # never overwrite an earlier archive
+        n += 1
+        dest = dest.with_name(f"{stage}.attempt{attempt}.{suffix or 'dup'}{n}.md")
     shutil.move(str(src), dest)
     return str(dest.relative_to(run_dir))
 
@@ -573,19 +581,22 @@ def cmd_next(run_dir: Path, _a) -> dict:
     if invalid:
         save(run_dir, m)
     table = stage_table(m)
-    runnable, interrupted = [], []
+    runnable, interrupted, recoverable = [], [], []
     for stage in table:
         st = m["stages"][stage]
         if st["status"] == "ok":
             continue
         if st["status"] == "in_progress":
             interrupted.append(stage)
+            if (run_dir / table[stage][0]).is_file():
+                recoverable.append(stage)  # output saved, never recorded: try `record` first
         if not check_deps(m, stage):
             runnable.append({"stage": stage, "agent": table[stage][1], "artifact": table[stage][0],
                              "previous_status": st["status"], "attempts": st.get("attempts", 0)})
     done = all(m["stages"][s]["status"] == "ok" for s in table)
     return {"ok": True, "run_id": m["run_id"], "run_status": m["status"], "all_stages_ok": done,
-            "runnable": runnable, "interrupted": interrupted, "invalidated": invalid}
+            "runnable": runnable, "interrupted": interrupted, "recoverable": recoverable,
+            "invalidated": invalid}
 
 
 def cmd_assemble(run_dir: Path, a) -> dict:

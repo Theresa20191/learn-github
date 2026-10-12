@@ -219,6 +219,27 @@ class Recovery(Base):
         m = json.loads((self.dir / "manifest.json").read_text())
         self.assertTrue(any(e["event"] == "interrupted_attempt_detected" for e in m["events"]))
 
+    def test_saved_but_unrecorded_output_is_recoverable(self):
+        self.write_and_record("requirements", "requirements_snapshot.md", fixture("requirements.md"))
+        for st in ("proposal_a", "proposal_b"):
+            run(self.root, "start", self.run_id, st)
+        (self.dir / "proposal_a.md").write_text(fixture("proposal.md"))  # saved, then session died
+        code, nxt = run(self.root, "next", self.run_id)
+        self.assertEqual(nxt["recoverable"], ["proposal_a"])
+        self.assertEqual(sorted(nxt["interrupted"]), ["proposal_a", "proposal_b"])
+        code, out = run(self.root, "record", self.run_id, "proposal_a")
+        self.assertTrue(out["ok"], out)
+        m = json.loads((self.dir / "manifest.json").read_text())
+        self.assertEqual(m["stages"]["proposal_a"]["independence"], "clean")
+
+    def test_restart_archives_stale_output(self):
+        self.write_and_record("requirements", "requirements_snapshot.md", fixture("requirements.md"))
+        run(self.root, "start", self.run_id, "proposal_a")
+        (self.dir / "proposal_a.md").write_text("half-written")
+        code, out = run(self.root, "start", self.run_id, "proposal_a")
+        self.assertFalse((self.dir / "proposal_a.md").exists())
+        self.assertTrue((self.dir / "parts/failed/proposal_a.attempt1.stale.md").is_file())
+
     def test_tampered_artifact_invalidates_downstream(self):
         self.independent_stages()
         self.debate_stages()
