@@ -88,6 +88,7 @@ REQUIREMENTS_HEADINGS = [
     "Acceptance tests",
     "Optimisation priorities",
     "Gaps and conflicts",
+    "Assumptions",
     "User confirmations",
     "Sources",
 ]
@@ -259,6 +260,226 @@ def in_design_dir(path: str) -> bool:
 
 
 # --------------------------------------------------------------- validation
+#
+# Requirement evidence checks. These are deliberately simple, deterministic and
+# LEXICAL: they prove that a quoted passage exists at the cited location, is not a
+# heading, and shares wording, numbers and bound qualifiers with the requirement.
+# They do NOT prove semantic support (a negated or contradicting passage that
+# reuses the same words still passes). See "Limits" under T1 in templates/artifacts.md.
+
+TAG = re.compile(r"\[(source|interpretation|assumption|unsourced|unconfirmed):\s*(.*?)\]", re.I)
+CITE = re.compile(r'^(?P<path>[^\s:"“]+):(?P<l1>\d+)(?:-(?P<l2>\d+))?\s+["“](?P<q>[^"”]+)["”]\s*(?P<rest>;.*)?$')
+USER_CITE = re.compile(r"^user,\s*(?P<date>\d{4}-\d{2}-\d{2}),\s*(?P<q>Q\d+)\s*$", re.I)
+QA_LINE = re.compile(r"^\s*[-*]\s*(?P<id>Q\d+):(?P<q>.*?)\bA:(?P<a>.*)$")
+ID_TOKEN = re.compile(r"\b(?:FR|NFR|SP|OP|AT|PR|A|Q|HG|EXP)-?\d+\b")
+NUMBER = re.compile(r"(?<![\w.])\d+(?:\.\d+)?")
+STOPWORDS = set("""a an the and or of to in on for from with by is are be been must should may it its any each
+every per as at no not all this that will can also than into via only when where which who whose their there
+these those has have had was were does do done""".split())
+# Words that change what a bound or obligation means; they must be backed by the evidence.
+QUALIFIERS = ["hard cap", "soft target", "hard limit", "soft limit", "cap", "ceiling", "target", "limit",
+              "maximum", "minimum", "at most", "at least", "mandatory", "optional"]
+AMBIGUOUS = re.compile(r"\b(undecided|not (?:been |yet )?decided|tbd|to be (?:decided|determined|confirmed)|"
+                       r"open question|unclear|unknown|not sure|maybe|perhaps)\b|\?", re.I)
+PROSE_ASSUMPTION = re.compile(r"\b(assum\w*|presum\w*|treat(?:ed|ing|s)? (?:it |this )?as|"
+                              r"interpret(?:ed|ing|s)? (?:it |this )?as|default(?:s|ed)? to|wrote it as|taken as)\b", re.I)
+MAX_CITED_LINES = 5
+
+
+def norm(text: str) -> str:
+    text = text.replace("“", '"').replace("”", '"').replace("’", "'")
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def stems(text: str) -> set[str]:
+    words = re.findall(r"[a-z][a-z0-9]+", ID_TOKEN.sub(" ", norm(text)))
+    return {w[:5] for w in words if len(w) >= 3 and w not in STOPWORDS}
+
+
+def numbers(text: str) -> dict[str, str]:
+    """{normalised number: as written}; 0.30 and 0.3 compare equal."""
+    out: dict[str, str] = {}
+    for n in NUMBER.findall(ID_TOKEN.sub(" ", text)):
+        out.setdefault(n.rstrip("0").rstrip(".") if "." in n else n, n)
+    return out
+
+
+def qualifiers(text: str) -> set[str]:
+    low = norm(text)
+    return {q for q in QUALIFIERS if re.search(rf"\b{re.escape(q)}\b", low)}
+
+
+def check_citation(root: Path | None, rid: str, raw: str, claim: str, kind: str) -> tuple[list[str], str]:
+    """Validate one [source|interpretation: path:L "quote"] citation; return (errors, quote)."""
+    m = CITE.match(raw.strip())
+    if not m:
+        return [f'{rid}: {kind} citation must be path:LINE[-LINE] "exact quote" (got "{raw[:60]}")'], ""
+    errs: list[str] = []
+    path, l1 = m["path"], int(m["l1"])
+    l2 = int(m["l2"] or l1)
+    quote = m["q"]
+    if l2 < l1 or l2 - l1 + 1 > MAX_CITED_LINES:
+        errs.append(f"{rid}: cited range {l1}-{l2} is invalid or wider than {MAX_CITED_LINES} lines; cite the exact passage")
+    if len(quote.split()) < 3:
+        errs.append(f"{rid}: quote \"{quote}\" is too short to identify a passage (min 3 words)")
+    if root is None:
+        return errs, quote
+    fp = (root / path).resolve()
+    if not fp.is_relative_to(root.resolve()) or not fp.is_file():
+        return errs + [f"{rid}: cited file {path} does not exist in the repository"], quote
+    rel = fp.relative_to(root.resolve()).as_posix()
+    if rel.startswith("design/runs/"):
+        return errs + [f"{rid}: cites debate output {path}; requirements must cite original sources"], quote
+    lines = fp.read_text(errors="replace").splitlines()
+    if l2 > len(lines):
+        return errs + [f"{rid}: {path} has {len(lines)} lines; cited line {l2} does not exist"], quote
+    cited = lines[l1 - 1:l2]
+    content = [ln for ln in cited if ln.strip() and not ln.lstrip().startswith("#")]
+    if not content:
+        return errs + [f"{rid}: {path}:{l1} is a heading/title or blank line, not a requirement passage"], quote
+    if norm(quote) not in norm(" ".join(content)):
+        where = "only in a heading" if norm(quote) in norm(" ".join(cited)) else "not found"
+        return errs + [f"{rid}: quote \"{quote[:50]}\" {where} at {path}:{l1}{'-' + str(l2) if l2 != l1 else ''}"], quote
+    claim_stems, quote_stems = stems(claim), stems(quote)
+    shared = claim_stems & quote_stems
+    if len(shared) < 2 and not (len(shared) == 1 and len(claim_stems) <= 2):
+        errs.append(f"{rid}: cited passage shares too few terms with the requirement ({sorted(shared) or 'none'}); "
+                    "cite the passage that states it, or tag it as an interpretation/assumption")
+    if AMBIGUOUS.search(quote):
+        errs.append(f"{rid}: cited passage is ambiguous (\"{quote[:50]}\"); it cannot support a fact or an "
+                    "interpretation. Ask the user, or record an assumption")
+    return errs, quote
+
+
+def analyse_requirements(text: str, secs: dict[str, str], root: Path | None) -> tuple[list[str], list[str], dict]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    info: dict = {"classification": {}, "assumptions": [], "interpretations": [], "cited_paths": set()}
+
+    # Q/A log (user confirmations)
+    qa: dict[str, str] = {}
+    for line in secs.get("user confirmations", "").splitlines():
+        m = QA_LINE.match(line)
+        if m:
+            qa[m["id"]] = m["a"]
+            if not m["a"].strip():
+                errors.append(f"{m['id']} has no recorded answer")
+
+    # Assumption register
+    defined: dict[str, str] = {}
+    a_body = secs.get("assumptions", "")
+    for blk in re.split(r"(?m)^(?=###\s+A-\d+)", a_body):
+        m = re.match(r"###\s+(A-\d+)", blk)
+        if not m:
+            continue
+        aid = m.group(1)
+        defined[aid] = blk
+        for field in ("Basis:", "Impact:", "Confirm by:", "Status:"):
+            if field.lower() not in blk.lower():
+                errors.append(f"{aid} lacks '{field}'")
+        st = re.search(r"(?im)^status:\s*(\w+)", blk)
+        if st and st.group(1).lower() != "unconfirmed":
+            errors.append(f"{aid} has Status: {st.group(1)}. A confirmed assumption must become a requirement "
+                          "tagged [source: user, <date>, Qn] with a logged answer, not stay in the register")
+    if not defined and not re.search(r"(?i)\bnone\b", a_body):
+        errors.append("'## Assumptions' must list ### A-n entries or say 'None'")
+
+    referenced: set[str] = set()
+    ids: list[str] = []
+    for h in REQUIREMENT_SECTIONS:
+        for line in secs.get(h.lower(), "").splitlines():
+            m = REQ_ID.match(line)
+            if not m:
+                if line.strip() and PROSE_ASSUMPTION.search(line) and not re.search(r"\bA-\d+\b", line):
+                    errors.append(f"untagged assumption in '{h}': \"{line.strip()[:70]}\"")
+                continue
+            rid = m.group(1)
+            ids.append(rid)
+            tags = TAG.findall(line)
+            claim = TAG.sub(" ", line[m.end():])
+            claim = re.sub(r"\((?:covers|see)[^)]*\)", " ", claim, flags=re.I)
+            kinds = {k.lower() for k, _ in tags}
+            if "unsourced" in kinds:
+                errors.append(f"{rid} is still [unsourced]; ask the user and tag it [source: user, <date>, Qn] "
+                              "or record an assumption [assumption: A-n] before recording")
+                continue
+            if "unconfirmed" in kinds:
+                errors.append(f"{rid} uses [unconfirmed: ...]; record the assumption in '## Assumptions' and tag [assumption: A-n]")
+                continue
+            if not kinds & {"source", "interpretation", "assumption"}:
+                errors.append(f"{rid} has no [source: ...], [interpretation: ...] or [assumption: A-n] tag")
+                continue
+            evidence = []
+            for k, raw in tags:
+                k = k.lower()
+                if k == "assumption":
+                    for aid in re.findall(r"A-\d+", raw):
+                        referenced.add(aid)
+                    if not re.findall(r"A-\d+", raw):
+                        errors.append(f"{rid}: [assumption: ...] must reference an A-n entry")
+                elif k == "source" and raw.lower().startswith("user"):
+                    um = USER_CITE.match(raw.strip())
+                    if not um:
+                        errors.append(f"{rid}: user citation must be [source: user, YYYY-MM-DD, Qn]")
+                    elif um["q"] not in qa:
+                        errors.append(f"{rid}: cites {um['q']} but '## User confirmations' has no '- {um['q']}: ... A: ...' entry")
+                    else:
+                        ans = qa[um["q"]]
+                        evidence.append(ans)
+                        if AMBIGUOUS.search(ans):
+                            errors.append(f"{rid}: answer to {um['q']} is ambiguous; it cannot support a fact")
+                else:
+                    errs, quote = check_citation(root, rid, raw, claim, k)
+                    errors += errs
+                    cm = CITE.match(raw.strip())
+                    if cm:  # a malformed citation contributes no evidence (avoids cascading errors)
+                        evidence.append(quote)
+                        info["cited_paths"].add(cm["path"])
+            has_assumption = "assumption" in kinds
+            if evidence:
+                ev = " ".join(evidence)
+                claim_nums = numbers(claim)
+                for n in sorted(claim_nums.keys() - numbers(ev).keys()):
+                    msg = f"{rid}: number {claim_nums[n]} is not in its cited evidence"
+                    (warnings if has_assumption else errors).append(
+                        msg + (" (rests on its assumption)" if has_assumption else "; cite it or record an assumption"))
+                for q in sorted(qualifiers(claim) - qualifiers(ev)):
+                    msg = f"{rid}: qualifier '{q}' is not in its cited evidence"
+                    (warnings if has_assumption else errors).append(
+                        msg + (" (rests on its assumption)" if has_assumption else "; cite it or record an assumption"))
+            if PROSE_ASSUMPTION.search(claim) and not has_assumption:
+                errors.append(f"{rid}: wording states an assumption; tag it [assumption: A-n]")
+            if has_assumption:
+                cls = "assumption"
+            elif "interpretation" in kinds:
+                cls = "interpretation"
+                info["interpretations"].append(rid)
+                warnings.append(f"{rid} is an interpretation of its source, not a stated requirement")
+            else:
+                cls = "fact"
+            info["classification"][rid] = cls
+
+    for aid in sorted(referenced - set(defined)):
+        errors.append(f"{aid} is referenced but not defined under '## Assumptions'")
+    for aid in sorted(set(defined) - referenced):
+        errors.append(f"{aid} is not referenced by any requirement; tag the requirements it affects")
+    for aid in sorted(defined):
+        warnings.append(f"{aid} is an unconfirmed assumption")
+    info["assumptions"] = sorted(defined)
+
+    for h in ("gaps and conflicts", "user confirmations"):
+        for line in secs.get(h, "").splitlines():
+            if PROSE_ASSUMPTION.search(line) and not re.search(r"\bA-\d+\b", line):
+                errors.append(f"untagged assumption in '{h}': \"{line.strip()[:70]}\"; record it as A-n")
+
+    sources_body = secs.get("sources", "")
+    for path in sorted(info["cited_paths"]):
+        if path not in sources_body:
+            errors.append(f"cited file {path} is not listed under '## Sources'")
+    info["cited_paths"] = sorted(info["cited_paths"])
+    info["ids"] = ids
+    return errors, warnings, info
+
 
 def sections(text: str) -> dict[str, str]:
     """Split Markdown into {level-2 heading (lower-case): body}."""
@@ -294,8 +515,12 @@ def percents(body: str) -> list[int]:
             for x in re.findall(r"\b(\d{1,3})\s*%", line)]
 
 
-def validate(kind: str, text: str, stage: str) -> tuple[list[str], list[str]]:
-    """Return (errors, warnings) for an artifact of the given kind."""
+def validate(kind: str, text: str, stage: str, ctx: dict | None = None) -> tuple[list[str], list[str]]:
+    """Return (errors, warnings) for an artifact of the given kind.
+
+    ctx: {"root": repo root (enables citation checks), "assumptions": [A-n ids from the snapshot]}
+    """
+    ctx = ctx or {}
     errors: list[str] = []
     warnings: list[str] = []
     if not text.strip():
@@ -304,23 +529,13 @@ def validate(kind: str, text: str, stage: str) -> tuple[list[str], list[str]]:
 
     if kind == "requirements":
         errors += require_headings(secs, REQUIREMENTS_HEADINGS)
-        ids = []
-        req_lines = [ln for h in REQUIREMENT_SECTIONS for ln in secs.get(h.lower(), "").splitlines()]
-        for line in req_lines:
-            m = REQ_ID.match(line)
-            if not m:
-                continue
-            ids.append(m.group(1))
-            low = line.lower()
-            if "[unsourced" in low:
-                # Questions are asked BEFORE the snapshot is frozen; a frozen snapshot
-                # can never be amended with the answers (supersede instead).
-                errors.append(f"{m.group(1)} is still [unsourced]; ask the user and tag it "
-                              "[source: user, <date>] or [unconfirmed: <reason>] before recording")
-            elif "[unconfirmed" in low:
-                warnings.append(f"{m.group(1)} is an unconfirmed assumption")
-            elif "[source:" not in low:
-                errors.append(f"{m.group(1)} has no [source: ...] or [unconfirmed: ...] tag")
+        # Questions are asked BEFORE the snapshot is frozen; a frozen snapshot can
+        # never be amended with the answers (supersede instead).
+        req_errors, req_warnings, info = analyse_requirements(text, secs, ctx.get("root"))
+        errors += req_errors
+        warnings += req_warnings
+        ctx["requirements_info"] = info
+        ids = info["ids"]
         if not ids:
             errors.append("no requirement IDs (FR-/NFR-/SP-/OP-/AT-/PR-) found")
         if not any(i.startswith("AT-") for i in ids):
@@ -330,8 +545,6 @@ def validate(kind: str, text: str, stage: str) -> tuple[list[str], list[str]]:
         src = secs.get("sources", "")
         if not re.search(r"\S", src):
             errors.append("'## Sources' is empty")
-        if "[source: user" in text.lower() and not re.search(r"(?im)^\s*[-*]\s*Q:", secs.get("user confirmations", "")):
-            errors.append("items cite [source: user, ...] but '## User confirmations' records no '- Q: ... A: ...' entries")
 
     elif kind == "proposal":
         errors += require_headings(secs, PROPOSAL_HEADINGS)
@@ -388,6 +601,9 @@ def validate(kind: str, text: str, stage: str) -> tuple[list[str], list[str]]:
         add = secs.get("additional round", "")
         if not re.search(r"(?i)required:\s*(yes|no)\b", add):
             errors.append("'## Additional round' must state 'Required: yes' or 'Required: no'")
+        for aid in ctx.get("assumptions", []):
+            if not re.search(rf"\b{aid}\b", text):
+                errors.append(f"requirements assumption {aid} is not addressed in the decision record")
         tags = set(re.findall(r"\[(MEASURED|ESTIMATE|JUDGEMENT|UNVERIFIED)\]", text))
         if not ({"ESTIMATE", "JUDGEMENT"} & tags):
             errors.append("decision does not classify evidence ([MEASURED]/[ESTIMATE]/[JUDGEMENT])")
@@ -532,7 +748,8 @@ def cmd_record(run_dir: Path, a) -> dict:
         raise StateError(f"stage {a.stage} blocked; prerequisites not ok: {missing}")
     path = run_dir / rel
     text = path.read_text() if path.is_file() else ""
-    errors, warnings = validate(kind, text, a.stage)
+    ctx = {"root": run_dir.parents[2], "assumptions": m.get("requirements_assumptions", [])}
+    errors, warnings = validate(kind, text, a.stage, ctx)
     if not path.is_file():
         errors = ["artifact file not written (missing agent output)"]
     attempt = st.get("attempts", 0) or 1
@@ -550,8 +767,12 @@ def cmd_record(run_dir: Path, a) -> dict:
     elif a.stage in PEER_ARTIFACTS:
         st["independence"] = "clean"
     if a.stage == "requirements":
+        info = ctx["requirements_info"]
         m["requirements_sha256"] = st["sha256"]
         m["requirements_sources"] = hash_sources(run_dir, text)
+        m["requirements_classification"] = info["classification"]
+        m["requirements_assumptions"] = info["assumptions"]
+        m["requirements_interpretations"] = info["interpretations"]
     event(m, "record_ok", stage=a.stage)
     save(run_dir, m)
     return {"ok": True, "stage": a.stage, "sha256": st["sha256"], "warnings": warnings}
@@ -816,7 +1037,9 @@ def cmd_finalize(run_dir: Path, a) -> dict:
     m["finalized_at"] = now()
     m["acceptance_checks"] = {"all_stages_ok": nxt["all_stages_ok"], "guard_ok": guard["ok"],
                               "independence_ok": ind["ok"], "independence_weakened": ind["weakened"],
-                              "unconfirmed_requirements": m["stages"]["requirements"].get("warnings", []),
+                              "requirements_assumptions": m.get("requirements_assumptions", []),
+                              "requirements_interpretations": m.get("requirements_interpretations", []),
+                              "requirements_warnings": m["stages"]["requirements"].get("warnings", []),
                               "problems": problems}
     event(m, "finalize", status=m["status"])
     save(run_dir, m)

@@ -27,6 +27,21 @@ def fixture(name):
     return (FIX / name).read_text()
 
 
+FR1_SRC = ' [source: docs/requirements.md:3 "generates a tailored resume from a master profile and a job description"]'
+PR1_SRC = '[source: docs/requirements.md:9 "Factual integrity takes priority over speed"]'
+NFR2_LINE = ('- NFR-2 Model usage under USD 0.50 per job description, as a target '
+             '[source: docs/requirements.md:10 "Target cost: under USD 0.50 of model usage per job description"]')
+NO_ASSUMPTIONS = "## Assumptions\nNone.\n"
+NO_QA = "- None required: every item is sourced."
+ASSUMPTION_A1 = """## Assumptions
+### A-1 Factual integrity outranks speed
+Basis: the source orders them but the user was not asked to confirm (non-interactive run).
+Impact: PR-1; judge weights.
+Confirm by: ask the user which takes priority.
+Status: unconfirmed
+"""
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -38,7 +53,7 @@ class Base(unittest.TestCase):
         (self.root / "src").mkdir()
         (self.root / "src" / "app.py").write_text("print('resume')\n")
         (self.root / "docs").mkdir()
-        (self.root / "docs" / "requirements.md").write_text("# Resume Auto-Pilot requirements\n")
+        (self.root / "docs" / "requirements.md").write_text(fixture("source_requirements.md"))
         g("add", ".")
         g("commit", "-qm", "init")
         code, out = run(self.root, "init")
@@ -56,8 +71,8 @@ class Base(unittest.TestCase):
         self.assertEqual(out["ok"], expect_ok, out)
         return out
 
-    def independent_stages(self):
-        self.write_and_record("requirements", "requirements_snapshot.md", fixture("requirements.md"))
+    def independent_stages(self, requirements=None):
+        self.write_and_record("requirements", "requirements_snapshot.md", requirements or fixture("requirements.md"))
         stages = [("proposal_a", "proposal_a.md", fixture("proposal.md").replace("<X>", "A")),
                   ("proposal_b", "proposal_b.md", fixture("proposal.md").replace("<X>", "B")),
                   ("risk_a", "risk_assessment_a.md", fixture("risk.md")),
@@ -135,7 +150,7 @@ class FullRun(Base):
 
 class Validation(Base):
     def test_unsourced_requirement_rejected(self):
-        bad = fixture("requirements.md").replace(" [source: docs/requirements.md:3]", "", 1)
+        bad = fixture("requirements.md").replace(FR1_SRC, "", 1)
         out = self.write_and_record("requirements", "requirements_snapshot.md", bad, expect_ok=False)
         self.assertTrue(any("FR-1" in e for e in out["errors"]))
 
@@ -305,14 +320,13 @@ class Stage1Freeze(Base):
     after which `next` offered `requirements` as runnable again in the same run.
     """
     def draft_with_question(self):
-        return fixture("requirements.md").replace("[source: docs/requirements.md:9]",
-                                                  "[unsourced: needs user confirmation]")
+        return fixture("requirements.md").replace(PR1_SRC, "[unsourced: needs user confirmation]")
 
     def answered(self):
         return (fixture("requirements.md")
-                .replace("[source: docs/requirements.md:9]", "[source: user, 2026-10-12]")
-                .replace("- None required: every item is sourced.",
-                         "- Q: Is factual integrity ranked above speed? A: Yes (2026-10-12) -> PR-1"))
+                .replace(PR1_SRC, "[source: user, 2026-10-12, Q1]")
+                .replace(NO_QA, "- Q1: Is factual integrity ranked above speed? A: Yes, factual integrity "
+                                "over speed (2026-10-12) -> PR-1"))
 
     def snapshot(self):
         return (self.dir / "requirements_snapshot.md").read_bytes()
@@ -370,7 +384,7 @@ class Stage1Freeze(Base):
                               expect_ok=False)
         out = self.write_and_record("requirements", "requirements_snapshot.md", self.answered())
         self.assertEqual(out["warnings"], [])
-        self.assertIn(b"Q: Is factual integrity ranked above speed?", self.snapshot())
+        self.assertIn(b"Q1: Is factual integrity ranked above speed?", self.snapshot())
         m = json.loads((self.dir / "manifest.json").read_text())
         self.assertEqual(m["stages"]["requirements"]["attempts"], 2)
         self.assertTrue((self.dir / "parts/failed/requirements.attempt1.md").is_file())
@@ -394,17 +408,29 @@ class Stage1Freeze(Base):
         self.assertFalse(list((self.dir / "parts/failed").glob("*stale*")))
 
     def test_user_source_requires_logged_question(self):
-        txt = fixture("requirements.md").replace("[source: docs/requirements.md:9]", "[source: user, 2026-10-12]")
+        txt = fixture("requirements.md").replace(PR1_SRC, "[source: user, 2026-10-12, Q1]")
         out = self.write_and_record("requirements", "requirements_snapshot.md", txt, expect_ok=False)
-        self.assertTrue(any("User confirmations" in e for e in out["errors"]))
+        self.assertIn("PR-1: cites Q1 but '## User confirmations' has no '- Q1: ... A: ...' entry", out["errors"])
+        # the pre-fix untagged form is rejected too
+        txt = fixture("requirements.md").replace(PR1_SRC, "[source: user, 2026-10-12]")
+        out = self.write_and_record("requirements", "requirements_snapshot.md", txt, expect_ok=False)
+        self.assertIn("PR-1: user citation must be [source: user, YYYY-MM-DD, Qn]", out["errors"])
 
-    def test_unconfirmed_assumption_is_warning_and_reported(self):
-        txt = fixture("requirements.md").replace("[source: docs/requirements.md:9]",
-                                                 "[unconfirmed: non-interactive run, could not ask]")
+    def test_recorded_assumption_is_warning_and_reported(self):
+        txt = (fixture("requirements.md").replace(PR1_SRC, "[assumption: A-1]")
+               .replace(NO_ASSUMPTIONS, ASSUMPTION_A1))
         out = self.write_and_record("requirements", "requirements_snapshot.md", txt)
-        self.assertEqual(out["warnings"], ["PR-1 is an unconfirmed assumption"])
+        self.assertEqual(out["warnings"], ["A-1 is an unconfirmed assumption"])
         code, fin = run(self.root, "finalize", self.run_id)
-        self.assertEqual(fin["checks"]["unconfirmed_requirements"], ["PR-1 is an unconfirmed assumption"])
+        self.assertEqual(fin["checks"]["requirements_assumptions"], ["A-1"])
+        m = json.loads((self.dir / "manifest.json").read_text())
+        self.assertEqual(m["requirements_classification"]["PR-1"], "assumption")
+        self.assertEqual(m["requirements_classification"]["FR-1"], "fact")
+
+    def test_legacy_unconfirmed_tag_rejected(self):
+        txt = fixture("requirements.md").replace(PR1_SRC, "[unconfirmed: non-interactive run, could not ask]")
+        out = self.write_and_record("requirements", "requirements_snapshot.md", txt, expect_ok=False)
+        self.assertTrue(any("record the assumption" in e for e in out["errors"]), out)
 
     def test_missing_user_confirmations_section_rejected(self):
         txt = fixture("requirements.md").replace("## User confirmations\n- None required: every item is sourced.\n", "")
@@ -454,6 +480,229 @@ class Stage1Freeze(Base):
                          ["requirements_changed"])
         self.assertTrue(run(self.root, "guard", self.run_id)[1]["ok"])
         self.assertTrue(run(self.root, "guard", out["new_run_id"])[1]["ok"])
+
+
+class CitationRelevance(Base):
+    """Citations must point at the exact source passage that states the requirement."""
+
+    def rec(self, txt, ok):
+        return self.write_and_record("requirements", "requirements_snapshot.md", txt, expect_ok=ok)
+
+    def with_fr1(self, tag):
+        return fixture("requirements.md").replace(FR1_SRC, " " + tag)
+
+    def test_relevant_citations_accepted_and_classified_as_facts(self):
+        out = self.rec(fixture("requirements.md"), True)
+        self.assertEqual(out["warnings"], [])
+        m = json.loads((self.dir / "manifest.json").read_text())
+        self.assertEqual(set(m["requirements_classification"].values()), {"fact"})
+        self.assertEqual(m["requirements_assumptions"], [])
+
+    def test_pre_fix_phantom_citation_without_quote_rejected(self):
+        # Before this fix, "[source: path:line]" was accepted without opening the file.
+        out = self.rec(self.with_fr1("[source: docs/requirements.md:3]"), False)
+        self.assertTrue(any('FR-1: source citation must be path:LINE[-LINE] "exact quote"' in e for e in out["errors"]))
+        # a malformed citation yields one format error, not cascading number/qualifier errors
+        txt = fixture("requirements.md").replace(NFR2_LINE, "- NFR-2 Model usage under USD 0.50 per job description, "
+                                                            "as a target [source: docs/requirements.md:10]")
+        out = self.rec(txt, False)
+        self.assertEqual([e for e in out["errors"] if e.startswith("NFR-2")],
+                         ['NFR-2: source citation must be path:LINE[-LINE] "exact quote" (got "docs/requirements.md:10")'])
+
+    def test_title_line_rejected(self):
+        # observed live: OP-1 cited the file's title line (line 1)
+        out = self.rec(self.with_fr1('[source: docs/requirements.md:1 "Resume Auto-Pilot requirements (SYNTHETIC TEST SOURCE)"]'), False)
+        self.assertIn("FR-1: docs/requirements.md:1 is a heading/title or blank line, not a requirement passage", out["errors"])
+
+    def test_blank_line_rejected(self):
+        out = self.rec(self.with_fr1('[source: docs/requirements.md:2 "generates a tailored resume"]'), False)
+        self.assertTrue(any("heading/title or blank line" in e for e in out["errors"]))
+
+    def test_heading_inside_range_cannot_carry_the_quote(self):
+        out = self.rec(self.with_fr1('[source: docs/requirements.md:1-3 "Resume Auto-Pilot requirements (SYNTHETIC"]'), False)
+        self.assertTrue(any("only in a heading" in e for e in out["errors"]), out)
+
+    def test_irrelevant_passage_rejected(self):
+        out = self.rec(self.with_fr1('[source: docs/requirements.md:7 "The tool runs locally from the command line"]'), False)
+        self.assertTrue(any("FR-1: cited passage shares too few terms" in e for e in out["errors"]), out)
+
+    def test_quote_not_at_cited_line_rejected(self):
+        out = self.rec(self.with_fr1('[source: docs/requirements.md:4 "generates a tailored resume from a master profile"]'), False)
+        self.assertTrue(any("not found at docs/requirements.md:4" in e for e in out["errors"]), out)
+
+    def test_missing_file_line_and_untagged_requirement_rejected(self):
+        out = self.rec(self.with_fr1('[source: docs/nope.md:3 "generates a tailored resume from"]'), False)
+        self.assertIn("FR-1: cited file docs/nope.md does not exist in the repository", out["errors"])
+        out = self.rec(self.with_fr1('[source: docs/requirements.md:99 "generates a tailored resume from"]'), False)
+        self.assertTrue(any("cited line 99 does not exist" in e for e in out["errors"]))
+        out = self.rec(fixture("requirements.md").replace(FR1_SRC, ""), False)
+        self.assertIn("FR-1 has no [source: ...], [interpretation: ...] or [assumption: A-n] tag", out["errors"])
+
+    def test_too_short_quote_and_too_wide_range_rejected(self):
+        out = self.rec(self.with_fr1('[source: docs/requirements.md:3 "tailored resume"]'), False)
+        self.assertTrue(any("too short" in e for e in out["errors"]))
+        out = self.rec(self.with_fr1('[source: docs/requirements.md:3-11 "generates a tailored resume from"]'), False)
+        self.assertTrue(any("wider than 5 lines" in e for e in out["errors"]))
+
+    def test_cited_file_must_be_listed_and_must_not_be_debate_output(self):
+        (self.root / "docs" / "extra.md").write_text("The tool generates a tailored resume from a master profile.\n")
+        out = self.rec(self.with_fr1('[source: docs/extra.md:1 "generates a tailored resume from a master profile"]'), False)
+        self.assertIn("cited file docs/extra.md is not listed under '## Sources'", out["errors"])
+        snap = self.dir.relative_to(self.root) / "parts" / "x.md"
+        (self.root / snap).write_text("The tool generates a tailored resume from a master profile.\n")
+        out = self.rec(self.with_fr1(f'[source: {snap.as_posix()}:1 "generates a tailored resume from a master profile"]'), False)
+        self.assertTrue(any("cites debate output" in e for e in out["errors"]), out)
+
+    def test_ambiguous_evidence_cannot_be_a_fact_or_interpretation(self):
+        amb = '"whether output quality or model cost takes priority has not been decided"'
+        for tag in (f"[source: docs/requirements.md:11 {amb}]",
+                    f"[interpretation: docs/requirements.md:11 {amb}; read as balanced]"):
+            txt = fixture("requirements.md").replace(
+                "- PR-1 Factual integrity over speed " + PR1_SRC,
+                "- PR-1 Output quality and model cost priority is balanced " + tag)
+            out = self.rec(txt, False)
+            self.assertTrue(any("PR-1: cited passage is ambiguous" in e for e in out["errors"]), out)
+
+    def test_interpretation_is_accepted_but_labelled(self):
+        txt = fixture("requirements.md").replace(
+            '- FR-2 Generate a cover letter for each job description [source: docs/requirements.md:4 "generates a cover letter for each job description"]',
+            '- FR-2 Produce one cover letter file per job description in a batch [interpretation: docs/requirements.md:4 '
+            '"generates a cover letter for each job description"; "for each" read as one file per job]')
+        out = self.rec(txt, True)
+        self.assertIn("FR-2 is an interpretation of its source, not a stated requirement", out["warnings"])
+        m = json.loads((self.dir / "manifest.json").read_text())
+        self.assertEqual(m["requirements_classification"]["FR-2"], "interpretation")
+        self.assertEqual(m["requirements_interpretations"], ["FR-2"])
+
+    def test_known_limit_contradicting_passage_with_same_words_passes(self):
+        # DOCUMENTED LIMIT: the check is lexical. A requirement that negates its cited
+        # passage while reusing its words is NOT detected. This test pins that limit.
+        txt = fixture("requirements.md").replace("- OP-1 Runs locally from the CLI",
+                                                 "- OP-1 Never runs locally from the command line")
+        self.rec(txt, True)
+
+
+class AssumptionTraceability(Base):
+    """Assumptions must be explicit, registered, and carried to the decision.
+
+    Uses the USD 0.30 cost change observed in the live Stage 1 supersede test, where the
+    orchestrator silently decided "0.30 is a target, not a hard cap".
+    """
+    QA = "- Q1: What is the cost target now? A: The cost target is now USD 0.30 per job instead of 0.50 (2026-10-12)"
+    A1 = """## Assumptions
+### A-1 USD 0.30 is a soft target, not a hard cap
+Basis: the user gave a new target but did not say whether exceeding it is allowed.
+Impact: NFR-2; HG cost gate; budget guard design.
+Confirm by: ask the user whether 0.30 is a hard cap.
+Status: unconfirmed
+"""
+
+    def rec(self, txt, ok):
+        return self.write_and_record("requirements", "requirements_snapshot.md", txt, expect_ok=ok)
+
+    def snap(self, nfr2, gaps=None, assumptions=None, qa=True):
+        txt = fixture("requirements.md").replace(NFR2_LINE, nfr2)
+        if qa:
+            txt = txt.replace(NO_QA, self.QA)
+        if gaps:
+            txt = txt.replace("- Quality versus cost priority is open in the source (docs/requirements.md:11); "
+                              "not used by any requirement.", gaps)
+        if assumptions:
+            txt = txt.replace(NO_ASSUMPTIONS, assumptions)
+        return txt
+
+    def test_changed_number_cannot_cite_old_source(self):
+        txt = self.snap('- NFR-2 Model usage under USD 0.30 per job description, as a target '
+                        '[source: docs/requirements.md:10 "Target cost: under USD 0.50 of model usage per job description"]', qa=False)
+        out = self.rec(txt, False)
+        self.assertIn("NFR-2: number 0.30 is not in its cited evidence; cite it or record an assumption", out["errors"])
+
+    def test_user_answer_supports_new_number(self):
+        out = self.rec(self.snap("- NFR-2 Model usage under USD 0.30 per job description, as a target "
+                                 "[source: user, 2026-10-12, Q1]"), True)
+        self.assertEqual(out["warnings"], [])
+
+    def test_observed_silent_soft_target_rejected(self):
+        out = self.rec(self.snap("- NFR-2 Model usage under USD 0.30 per job description, as a soft target "
+                                 "[source: user, 2026-10-12, Q1]"), False)
+        self.assertIn("NFR-2: qualifier 'soft target' is not in its cited evidence; cite it or record an assumption",
+                      out["errors"])
+
+    def test_observed_prose_assumption_in_gaps_rejected(self):
+        gaps = ("- The user did not say whether USD 0.30 is a hard cap or a soft target; "
+                "I treated it as a target that a design must justify exceeding.")
+        out = self.rec(self.snap("- NFR-2 Model usage under USD 0.30 per job description, as a target "
+                                 "[source: user, 2026-10-12, Q1]", gaps=gaps), False)
+        self.assertTrue(any(e.startswith("untagged assumption in 'gaps and conflicts'") for e in out["errors"]), out)
+
+    def test_assumption_wording_on_cited_requirement_rejected(self):
+        out = self.rec(self.snap("- NFR-2 Model usage under USD 0.30 per job description, treated as a target "
+                                 "[source: user, 2026-10-12, Q1]"), False)
+        self.assertIn("NFR-2: wording states an assumption; tag it [assumption: A-n]", out["errors"])
+
+    def test_registered_assumption_accepted_and_traced_to_decision(self):
+        txt = self.snap("- NFR-2 Model usage under USD 0.30 per job description, as a soft target "
+                        "[source: user, 2026-10-12, Q1] [assumption: A-1]",
+                        gaps="- Hard cap versus soft target for USD 0.30 is open; see A-1.", assumptions=self.A1)
+        self.independent_stages(requirements=txt)
+        m = json.loads((self.dir / "manifest.json").read_text())
+        self.assertEqual(m["requirements_classification"]["NFR-2"], "assumption")
+        self.assertEqual(m["requirements_assumptions"], ["A-1"])
+        self.assertIn("NFR-2: qualifier 'soft target' is not in its cited evidence (rests on its assumption)",
+                      m["stages"]["requirements"]["warnings"])
+        self.debate_stages()
+        self.write_and_record("comparison_matrix", "comparison_matrix.md", fixture("matrix.md"))
+        out = self.write_and_record("final_decision", "final_decision.md", fixture("decision.md"), expect_ok=False)
+        self.assertIn("requirements assumption A-1 is not addressed in the decision record", out["errors"])
+        dec = fixture("decision.md").replace("## Remaining risks\n", "## Remaining risks\nA-1 (0.30 soft target) unconfirmed [UNVERIFIED].\n")
+        self.write_and_record("final_decision", "final_decision.md", dec)
+        code, fin = run(self.root, "finalize", self.run_id)
+        self.assertEqual(fin["status"], "completed", fin)
+        self.assertEqual(fin["checks"]["requirements_assumptions"], ["A-1"])
+
+    def test_assumption_cannot_be_marked_confirmed_in_register(self):
+        a1 = self.A1.replace("Status: unconfirmed", "Status: confirmed")
+        out = self.rec(self.snap("- NFR-2 Model usage under USD 0.30 per job description, as a soft target "
+                                 "[source: user, 2026-10-12, Q1] [assumption: A-1]", assumptions=a1), False)
+        self.assertTrue(any(e.startswith("A-1 has Status: confirmed") for e in out["errors"]), out)
+
+    def test_register_integrity(self):
+        a = self.A1 + "### A-2 Orphan\nBasis: x.\nImpact: none.\nConfirm by: ask.\nStatus: unconfirmed\n"
+        out = self.rec(self.snap("- NFR-2 Model usage under USD 0.30 per job description, as a soft target "
+                                 "[source: user, 2026-10-12, Q1] [assumption: A-1, A-3]", assumptions=a), False)
+        self.assertIn("A-3 is referenced but not defined under '## Assumptions'", out["errors"])
+        self.assertIn("A-2 is not referenced by any requirement; tag the requirements it affects", out["errors"])
+        out = self.rec(self.snap("- NFR-2 Model usage under USD 0.30 per job description, as a soft target "
+                                 "[source: user, 2026-10-12, Q1] [assumption: A-1]",
+                                 assumptions=self.A1.replace("Confirm by: ask the user whether 0.30 is a hard cap.\n", "")), False)
+        self.assertIn("A-1 lacks 'Confirm by:'", out["errors"])
+
+    def test_ambiguous_user_answer_rejected(self):
+        txt = self.snap("- NFR-2 Model usage under USD 0.30 per job description, as a target [source: user, 2026-10-12, Q1]")
+        txt = txt.replace(self.QA, "- Q1: What is the cost target now? A: Not sure, maybe a USD 0.30 target (2026-10-12)")
+        out = self.rec(txt, False)
+        self.assertIn("NFR-2: answer to Q1 is ambiguous; it cannot support a fact", out["errors"])
+
+    def test_assumption_confirmed_only_via_logged_answer_in_new_run(self):
+        txt = self.snap("- NFR-2 Model usage under USD 0.30 per job description, as a soft target "
+                        "[source: user, 2026-10-12, Q1] [assumption: A-1]", assumptions=self.A1)
+        self.rec(txt, True)
+        before = (self.dir / "requirements_snapshot.md").read_bytes()
+        code, sup = run(self.root, "supersede", self.run_id, "--reason", "user confirmed 0.30 is a hard cap")
+        new_dir = Path(sup["new_run_dir"])
+        confirmed = (fixture("requirements.md")
+                     .replace(NFR2_LINE, "- NFR-2 Model usage under USD 0.30 per job description, as a hard cap "
+                                         "[source: user, 2026-10-13, Q2]")
+                     .replace(NO_QA, self.QA + "\n- Q2: Is USD 0.30 a hard cap or a soft target? "
+                                               "A: A hard cap of USD 0.30 (2026-10-13)"))
+        run(self.root, "start", sup["new_run_id"], "requirements")
+        (new_dir / "requirements_snapshot.md").write_text(confirmed)
+        code, rec = run(self.root, "record", sup["new_run_id"], "requirements")
+        self.assertTrue(rec["ok"], rec)
+        nm = json.loads((new_dir / "manifest.json").read_text())
+        self.assertEqual(nm["requirements_classification"]["NFR-2"], "fact")
+        self.assertEqual(nm["requirements_assumptions"], [])
+        self.assertEqual((self.dir / "requirements_snapshot.md").read_bytes(), before)
 
 
 class Guard(Base):
@@ -521,6 +770,15 @@ class Conventions(unittest.TestCase):
             if stage.endswith(("_a", "_b")):
                 stage = stage[:-2]
             self.assertIn(stage, body, stage)
+
+    def test_project_permission_rules(self):
+        # Verified live in a trusted workspace: Claude Code ignores Write(path) rules
+        # ("only Edit(path) rules are" matched); Edit rules cover all file-editing tools.
+        rules = json.loads((REPO / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+        self.assertFalse([r for r in rules if r.startswith("Write(")], rules)
+        self.assertIn("Edit(/design/runs/**)", rules)
+        self.assertIn("Bash(python3 .claude/skills/resume-design-debate/scripts/debate_run.py:*)", rules)
+        self.assertFalse([r for r in rules if r in ("Bash", "Edit", "Write") or "(*" in r or "**)" in r and "design/runs" not in r])
 
     def test_templates_match_validator(self):
         sys.path.insert(0, str(SKILL / "scripts"))

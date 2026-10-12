@@ -3,7 +3,7 @@
 The orchestrator pastes the relevant template into each agent prompt. Headings are
 validated mechanically by `scripts/debate_run.py`. Keep them word for word; numbering
 prefixes such as `## 1.` are allowed. Tags used everywhere:
-`[source: path:line]`, `[UNVERIFIED]`, `[ESTIMATE]`, `[MEASURED]`, `[JUDGEMENT]`.
+`[UNVERIFIED]`, `[ESTIMATE]`, `[MEASURED]`, `[JUDGEMENT]`. Requirement evidence tags are defined under T1.
 
 ---
 
@@ -14,33 +14,54 @@ prefixes such as `## 1.` are allowed. Tags used everywhere:
 Scope: <full-system | module name>. Focus: <focus>. Frozen at commit <sha>.
 
 ## Functional requirements
-- FR-1 <requirement> [source: path:line]
+- FR-1 <requirement> [source: docs/spec.md:12 "exact words from line 12"]
 ## Non-functional requirements
-- NFR-1 ... [source: ...]
+- NFR-1 <requirement> [source: user, 2026-10-12, Q1]
 ## Safety and privacy constraints
-- SP-1 ... [source: ...]
+- SP-1 ... [source: path:L-M "exact words spanning lines L to M"]
 ## Operational constraints
-- OP-1 ... [source: ...]
+- OP-1 <derived requirement> [interpretation: path:L "exact words"; why this reading]
 ## Acceptance tests
 - AT-1 <observable pass/fail check> (covers FR-1, SP-2) [source: ...]
 ## Optimisation priorities
-- PR-1 <priority, ordered> [source: ...]
+- PR-1 <priority, ordered> [assumption: A-1]
 ## Gaps and conflicts
-- <missing requirement or conflict between sources, and how it was handled>
+- <missing requirement or conflict between sources>. Any assumption made about it: see A-n.
+## Assumptions
+### A-1 <the assumed statement>
+Basis: <why it is assumed; what evidence exists>
+Impact: <requirements and decisions that depend on it>
+Confirm by: <the question to ask the user, or the experiment>
+Status: unconfirmed
+(or "None.")
 ## User confirmations
-- Q: <question asked before freezing> A: <user's answer> (<date>) → affects PR-1
-  (or "None required: every item is sourced.")
+- Q1: <question asked before freezing> A: <user's answer, verbatim> (<date>)
+  (or "- None required: every item is sourced.")
 ## Sources
 - path/to/file.md  (what it contributed)
 ```
 
-Tags and their lifecycle:
-- `[unsourced: needs user confirmation]` is allowed **only in the draft**. `record` rejects it.
-- Before recording, ask the user. Retag each answered item `[source: user, <date>]` and log it under
-  *User confirmations*. Retag an item the user declined, or that can't be asked about (non-interactive run),
-  as `[unconfirmed: <reason>]`. That is accepted, but reported as a warning.
-- Once recorded, the snapshot is frozen. Changed requirements or answers mean `supersede`, which creates a new run.
-  Never edit a recorded snapshot. Never add a priority silently.
+Evidence tags (validated by `record`):
+
+| Tag | Meaning | Mechanical checks |
+|---|---|---|
+| `[source: path:L "quote"]` or `path:L-M` (max 5 lines) | Stated in the source | File exists in repo and is listed under *Sources*; not `design/runs/`; lines exist; quote is ≥3 words and appears verbatim (case/whitespace-insensitive) in non-heading, non-blank cited lines; ≥2 shared content terms with the requirement; every number and bound qualifier (cap, target, limit, hard/soft, maximum, minimum, at most/least, mandatory, optional) in the requirement appears in the quote; quote is not ambiguous (undecided, TBD, open question, unclear, maybe, `?` …) |
+| `[source: user, YYYY-MM-DD, Qn]` | Stated by the user | `Qn` is logged under *User confirmations* with an answer; numbers and qualifiers appear in the answer; answer is not ambiguous |
+| `[interpretation: path:L "quote"; reason]` | Derived from a source, not stated | Same checks as a source citation (a number or qualifier the quote lacks needs an `A-n`); reported as a warning and classified `interpretation` |
+| `[assumption: A-n]` | Not supported by evidence | `A-n` is registered under *Assumptions* with Basis, Impact, Confirm by and `Status: unconfirmed`; every registered A-n is referenced; numbers or qualifiers not in the other evidence are allowed but reported; classified `assumption`; the final decision must mention every A-n |
+| `[unsourced: needs user confirmation]` | Draft only | `record` rejects it; ask the user first |
+
+Prose anywhere in the requirement sections, *Gaps and conflicts* or *User confirmations* that states an
+assumption (assume, presume, treat as, interpret as, default to, taken as …) must reference an `A-n`.
+A confirmed assumption is never edited to `Status: confirmed`. Once the snapshot is frozen, confirming
+it means `supersede`: the new run logs the answer as `Qn` and cites `[source: user, <date>, Qn]`.
+Never add a priority silently.
+
+**Limits:** these checks are lexical. They prove the quote exists at the cited place and shares terms,
+numbers and qualifiers with the requirement. They do **not** prove the passage supports the meaning. A
+requirement that negates or narrows its passage while reusing its words passes, and so does a paraphrase
+that keeps the shared terms. A correct paraphrase with no shared terms can be rejected. Assumption detection
+in prose is keyword-based and misses unmarked assumptions.
 
 ---
 

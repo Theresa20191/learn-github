@@ -42,20 +42,33 @@ installs, no destructive git commands, no commits unless the user asks.
    constraints), do not invent requirements. Run `H block <run> --reason "no Resume Auto-Pilot requirements found in <places searched>"`,
    report what you searched, and ask the user for a requirements file or the correct repository. Then stop.
 3. **Draft.** Write `<run_dir>/requirements_snapshot.md` using template T1. It stays a draft until step 5, so
-   do not run `start` or `record` yet. Every item must carry `[source: path:line]`. Tag anything you had to infer
-   `[unsourced: needs user confirmation]`. Record missing requirements and conflicts under *Gaps and conflicts*.
-   For a named-module scope, keep the module's requirements plus **all** cross-cutting safety, privacy and
-   factual-integrity constraints.
+   do not run `start` or `record` yet. Tag every requirement with its evidence, following the T1 tag table:
+   - `[source: path:L "exact quote"]` for something the source states. Quote the passage that states it, not a
+     title, heading, nearby line or summary.
+   - `[interpretation: path:L "quote"; reason]` for something you derived from a passage.
+   - `[unsourced: needs user confirmation]` for anything you would otherwise have to assume.
+   If a passage is ambiguous (undecided, TBD, an open question), it is not evidence; tag the item `[unsourced`.
+   Record missing requirements and conflicts under *Gaps and conflicts*. For a named-module scope, keep the module's
+   requirements plus **all** cross-cutting safety, privacy and factual-integrity constraints.
 4. **Ask before freezing.** If the draft has any `[unsourced` item, or *Gaps and conflicts* has a conflict that
    changes priorities, ask the user **now** in one AskUserQuestion with at most 4 questions. Ask nothing else.
-   - Retag each answered item `[source: user, <date>]` and log it under *User confirmations* as `- Q: … A: …`.
-   - Retag each item the user declines, or that you cannot ask about in a non-interactive session, as
-     `[unconfirmed: <reason>]`. Never make up an answer.
-   - If nothing needed asking, write `- None required: every item is sourced.`
-5. **Freeze.** Run `H start <run> requirements`, then `H record <run> requirements`. Recording rejects any remaining
-   `[unsourced` tag and any `[source: user …]` without a logged Q/A.
+   - Log each answer verbatim under *User confirmations* as `- Qn: … A: … (<date>)`, and retag the item
+     `[source: user, <date>, Qn]`. The requirement may only state what the answer states: numbers and bound
+     qualifiers such as hard cap or soft target must appear in the answer.
+   - Whatever the user did not decide, or what you cannot ask in a non-interactive session, is an **assumption**.
+     Register it as `### A-n` under *Assumptions* (Basis, Impact, Confirm by, `Status: unconfirmed`) and tag every
+     affected requirement `[assumption: A-n]`. Never make up an answer, and never state an assumption in prose without its `A-n`.
+   - If nothing needed asking, write `- None required: every item is sourced.` If nothing is assumed, write `None.`
+     under *Assumptions*.
+5. **Freeze.** Run `H start <run> requirements`, then `H record <run> requirements`. `record` opens every cited
+   file and enforces the T1 checks: the quote is at that line, the line is not a heading, the wording is relevant,
+   the numbers and qualifiers match the evidence, ambiguous evidence is not used, Q/A entries are logged, and the
+   assumption register is complete.
    - If validation fails, the draft is archived to `parts/failed/`. Write a corrected draft and run `start`/`record` again.
-     This is allowed only because nothing was frozen yet.
+     This is allowed only because nothing was frozen yet. Never satisfy the checker by citing a different passage that
+     does not state the requirement. Use `[assumption: A-n]` instead.
+   - The manifest records each requirement as `fact`, `interpretation` or `assumption`. Pass the assumption IDs to
+     every agent. The final decision must address each one.
 6. **Frozen means frozen.** After a successful `record`, never edit `requirements_snapshot.md`. If the user later
    changes a requirement or an answer, at any stage including after `completed`, run
    `H supersede <run> --reason "<what changed>"`. This marks the old run `superseded`, leaves its artifacts byte-for-byte
@@ -156,6 +169,10 @@ If a run is `blocked` or `superseded`, it is immutable: the helper refuses to st
 Start a new run once the blocker is resolved.
 
 ## Debate quality rules (apply them in every prompt)
+- Requirements tagged `interpretation` or `assumption` are not facts. Agents must not treat them as confirmed,
+  and the judge must name every `A-n` in the decision record, under *Remaining risks* or *Experiments*.
+- Citation checks are lexical, not semantic (see *Limits* in T1). Read the cited passages yourself; a passing
+  `record` does not prove that a passage supports the meaning.
 - Both architects get the same frozen snapshot, and the hash is in the manifest.
 - Every objection must link to a requirement ID, a failure scenario or a test. Volume and tone earn nothing.
 - Claims without evidence are `[UNVERIFIED]`. Estimates show how they were derived.
